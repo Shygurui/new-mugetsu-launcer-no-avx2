@@ -1,0 +1,106 @@
+diff --git b/src/inspect.rs b/src/inspect.rs
+new file mode 100644
+index 0000000..afc646e
+--- /dev/null
++++ b/src/inspect.rs
+@@ -0,0 +1,45 @@
++//! Heap inspection (AQW build of Ruffle): enumerate the `Gc` pointers a value holds, so a tool
++//! can walk the object graph from the root and find what keeps an object alive.
++
++use crate::{Gc, GcWeak, collect::Trace, types::GcPtr};
++
++/// Receives the edges of a value, as erased value pointers (`Gc::as_ptr`).
++pub trait RawEdgeVisitor {
++    fn visit_edge(&mut self, value_ptr: *const (), weak: bool);
++}
++
++/// A `Trace` implementation that reports every traced pointer to a [`RawEdgeVisitor`].
++/// Pass it to `Collect::trace` on a root (or any value) to list what it points to.
++pub struct RawEdgeTracer<'a>(pub &'a mut dyn RawEdgeVisitor);
++
++impl<'gc> Trace<'gc> for RawEdgeTracer<'_> {
++    fn trace_gc(&mut self, gc: Gc<'gc, ()>) {
++        self.0.visit_edge(Gc::as_ptr(gc), false);
++    }
++
++    fn trace_gc_weak(&mut self, gc: GcWeak<'gc, ()>) {
++        self.0.visit_edge(gc.as_ptr(), true);
++    }
++}
++
++/// Reports every pointer held by the value at `value_ptr`.
++///
++/// # Safety
++///
++/// `value_ptr` must come from `Gc::as_ptr` of a live (not dropped, not freed) `Gc` in an arena
++/// that is not being collected during the call. Strongly reachable values are always live.
++pub unsafe fn visit_edges(value_ptr: *const (), visitor: &mut dyn RawEdgeVisitor) {
++    unsafe {
++        let ptr = GcPtr::<()>::from_ptr(value_ptr);
++        (ptr.header().vtable().trace_edges)(value_ptr, &mut RawEdgeTracer(visitor));
++    }
++}
++
++/// The Rust type name of the value at `value_ptr`.
++///
++/// # Safety
++///
++/// Same as [`visit_edges`], except the value may already be dropped (only the header is read).
++pub unsafe fn type_name(value_ptr: *const ()) -> &'static str {
++    unsafe { (GcPtr::<()>::from_ptr(value_ptr).header().vtable().type_name)() }
++}
+diff --git a/src/lib.rs b/src/lib.rs
+index 49c0246..67adc32 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -13,6 +13,7 @@ pub mod collect;
+ mod collect_impl;
+ mod context;
+ pub mod dynamic_roots;
++pub mod inspect;
+ mod gc;
+ mod gc_weak;
+ pub mod lock;
+diff --git a/src/types.rs b/src/types.rs
+index ef9b4b1..bbd3b21 100644
+--- a/src/types.rs
++++ b/src/types.rs
+@@ -187,7 +187,7 @@ impl GcHeader {
+     }
+ 
+     #[inline(always)]
+-    fn vtable(&self) -> &'static CollectVtable {
++    pub(crate) fn vtable(&self) -> &'static CollectVtable {
+         let ptr = tagged_ptr::untag(self.tagged_vtable.get());
+         // SAFETY:
+         // - the pointer was properly untagged.
+@@ -265,13 +265,17 @@ impl GcHeader {
+ /// We use a custom vtable instead of `dyn Collect` for extra flexibility. The type is over-aligned
+ /// so that `GcHeader` can store flags into the LSBs of the vtable pointer.
+ #[repr(align(16))]
+-struct CollectVtable {
++pub(crate) struct CollectVtable {
+     /// Traces the value at the given pointer.
+     trace_value: unsafe fn(*const (), &mut Context),
+     /// Drops the value at the given pointer.
+     drop_value: unsafe fn(*mut ()),
+     /// The layout of the value stored in this `GcPtr`.
+     value_layout: Layout,
++    /// Reports the value's pointers to a heap inspector (see `crate::inspect`).
++    pub(crate) trace_edges: for<'a> unsafe fn(*const (), &mut crate::inspect::RawEdgeTracer<'a>),
++    /// The value's Rust type name (see `crate::inspect`).
++    pub(crate) type_name: fn() -> &'static str,
+ }
+ 
+ impl CollectVtable {
+@@ -288,6 +292,10 @@ impl CollectVtable {
+                 ptr::drop_in_place(ptr.cast::<T>());
+             },
+             value_layout: Layout::new::<T>(),
++            trace_edges: |ptr, tracer| unsafe {
++                ptr.cast::<T>().as_ref_unchecked().trace(tracer);
++            },
++            type_name: core::any::type_name::<T>,
+         }
+     }
+ }

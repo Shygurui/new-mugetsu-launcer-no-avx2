@@ -1,0 +1,23 @@
+diff --git a/src/hit_test.rs b/src/hit_test.rs
+index 1846c19..fc66dfd 100644
+--- a/src/hit_test.rs
++++ b/src/hit_test.rs
+@@ -14,6 +14,8 @@ where
+     match fill_rule {
+         FillRule::EvenOdd => winding % 2 != 0,
+         FillRule::NonZero => winding != 0,
++        // AQW build (see the patched lyon_path).
++        FillRule::Positive => winding > 0,
+     }
+ }
+ 
+diff --git a/src/lib.rs b/src/lib.rs
+index 0fafece..8c4ecbb 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -1,3 +1,5 @@
++// AQW build: vendored (see the root Cargo.toml's [patch]); its own warnings aren't ours.
++#![allow(warnings)]
+ #![doc(html_logo_url = "https://nical.github.io/lyon-doc/lyon-logo.svg")]
+ #![deny(bare_trait_objects)]
+ #![allow(clippy::float_cmp)]
