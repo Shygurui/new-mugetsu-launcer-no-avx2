@@ -1,0 +1,28 @@
+diff --git a/src/lib.rs b/src/lib.rs
+index afad385..347985f 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -1,3 +1,5 @@
++// AQW build: vendored (see the root Cargo.toml's [patch]); its own warnings aren't ours.
++#![allow(warnings)]
+ #![doc(html_logo_url = "https://nical.github.io/lyon-doc/lyon-logo.svg")]
+ #![deny(bare_trait_objects)]
+ #![deny(unconditional_recursion)]
+@@ -261,6 +263,9 @@ impl Side {
+ pub enum FillRule {
+     EvenOdd,
+     NonZero,
++    /// AQW build: inside where the winding number is above zero (parts wound the other way
++    /// are left out; used for Ruffle's moved fill outlines, whose inside-out bits wind back).
++    Positive,
+ }
+ 
+ impl FillRule {
+@@ -269,6 +274,7 @@ impl FillRule {
+         match *self {
+             FillRule::EvenOdd => winding_number % 2 != 0,
+             FillRule::NonZero => winding_number != 0,
++            FillRule::Positive => winding_number > 0,
+         }
+     }
+ 
