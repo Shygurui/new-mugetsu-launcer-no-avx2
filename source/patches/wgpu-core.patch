@@ -1,0 +1,477 @@
+diff --git a/src/command/mod.rs b/src/command/mod.rs
+index e61429e..2193d97 100644
+--- a/src/command/mod.rs
++++ b/src/command/mod.rs
+@@ -734,6 +734,15 @@ impl InnerCommandEncoder {
+         Ok(())
+     }
+ 
++    /// AQW build: lets the hal backend combine this encoder's finished command buffers into
++    /// fewer (see `hal::CommandEncoder::merge_command_buffers`; only D3D12 does). The encoder
++    /// must be closed.
++    pub(crate) fn merge(&mut self) -> Result<(), DeviceError> {
++        debug_assert!(!self.is_open);
++        unsafe { self.raw.merge_command_buffers(&mut self.list) }
++            .map_err(|e| self.device.handle_hal_error(e))
++    }
++
+     /// Finish the current command buffer, if any, and add it to the
+     /// end of [`self.list`][l].
+     ///
+@@ -1042,6 +1051,35 @@ impl CommandEncoder {
+         Self::drain_barriers(raw, base, snatch_guard);
+     }
+ 
++    /// AQW build: like [`Self::drain_barriers`], but only opens a command buffer on `encoder`
++    /// (with `label`) when there are barriers to record. Returns whether it opened one.
++    pub(crate) fn drain_barriers_into_new_pass(
++        encoder: &mut InnerCommandEncoder,
++        base: &mut Tracker,
++        snatch_guard: &SnatchGuard,
++        label: Option<&str>,
++    ) -> Result<bool, DeviceError> {
++        let buffer_barriers = base
++            .buffers
++            .drain_transitions(snatch_guard)
++            .collect::<Vec<_>>();
++        let (transitions, textures) = base.textures.drain_transitions(snatch_guard);
++        if buffer_barriers.is_empty() && transitions.is_empty() {
++            return Ok(false);
++        }
++        let texture_barriers = transitions
++            .into_iter()
++            .enumerate()
++            .map(|(i, p)| p.into_hal(textures[i].unwrap().raw()))
++            .collect::<Vec<_>>();
++        let raw = encoder.open_pass(label)?;
++        unsafe {
++            raw.transition_buffers(&buffer_barriers);
++            raw.transition_textures(&texture_barriers);
++        }
++        Ok(true)
++    }
++
+     pub(crate) fn drain_barriers(
+         raw: &mut dyn hal::DynCommandEncoder,
+         base: &mut Tracker,
+@@ -1310,6 +1348,8 @@ impl CommandEncoder {
+ 
+         // Close the encoder, unless it was closed already by a render or compute pass.
+         cmd_buf_data.encoder.close_if_open()?;
++        // AQW build: combine the command buffers now, on the thread that encoded them.
++        cmd_buf_data.encoder.merge()?;
+ 
+         // Note: if we want to stop tracking the swapchain texture view,
+         // this is the place to do it.
+diff --git a/src/command/query.rs b/src/command/query.rs
+index 59b3d48..16e7487 100644
+--- a/src/command/query.rs
++++ b/src/command/query.rs
+@@ -69,6 +69,11 @@ pub(crate) struct QueryResetMap {
+     map: FastHashMap<TrackerIndex, (Vec<bool>, Arc<QuerySet>)>,
+ }
+ impl QueryResetMap {
++    /// AQW build: whether there are no queries to reset.
++    pub fn is_empty(&self) -> bool {
++        self.map.is_empty()
++    }
++
+     pub fn new() -> Self {
+         Self {
+             map: FastHashMap::default(),
+diff --git a/src/command/render.rs b/src/command/render.rs
+index 75a150c..a351076 100644
+--- a/src/command/render.rs
++++ b/src/command/render.rs
+@@ -2720,6 +2720,31 @@ pub(super) fn encode_render_pass(
+     let encoder = &mut parent_state.raw_encoder;
+     let tracker = &mut parent_state.tracker;
+ 
++    // AQW build: a "Pre Pass" command buffer used to be opened before every render pass, even
++    // when it ended up empty. Ruffle records thousands of passes per frame in crowded AQW
++    // scenes, and on DirectX 12 every command list costs a Reset and a Close in the driver
++    // (~40% of render pass encoding). When there is nothing but barriers to record, compute
++    // the barriers first and only open the command buffer if there are any. The GPU gets
++    // exactly the same commands in the same order.
++    if pending_discard_init_fixups.is_empty()
++        && pending_query_resets.is_empty()
++        && device.indirect_validation.is_none()
++    {
++        tracker.buffers.set_from_usage_scope(&scope.buffers);
++        tracker.textures.set_from_usage_scope(&scope.textures);
++        let opened = CommandEncoder::drain_barriers_into_new_pass(
++            encoder,
++            tracker,
++            parent_state.snatch_guard,
++            hal_label(Some("(wgpu internal) Pre Pass"), device.instance_flags),
++        )
++        .map_pass_err(pass_scope)?;
++        if opened {
++            encoder.close_and_swap().map_pass_err(pass_scope)?;
++        }
++        return Ok(());
++    }
++
+     {
+         let transit = encoder
+             .open_pass(hal_label(
+diff --git a/src/device/life.rs b/src/device/life.rs
+index 322c855..4af9606 100644
+--- a/src/device/life.rs
++++ b/src/device/life.rs
+@@ -335,17 +335,18 @@ impl LifetimeTracker {
+         let done_count = self.active.partition_point(|a| a.index <= last_done);
+ 
+         let mut work_done_closures: SmallVec<_> = self.work_done_closures.drain(..).collect();
++        let mut finished = Vec::new();
+         for a in self.active.drain(..done_count) {
+             self.ready_to_map.extend(a.mapped);
+             self.ready_to_compact.extend(a.compact_read_back);
+-            for encoder in a.encoders {
+-                // This involves actually decrementing the ref count of all command buffer
+-                // resources, so can be _very_ expensive.
+-                profiling::scope!("drop command buffer trackers");
+-                drop(encoder);
+-            }
++            finished.extend(a.encoders);
+             work_done_closures.extend(a.work_done_closures);
+         }
++        // Dropping these decrements the ref count of all command buffer resources (and
++        // destroys the ones that were only kept alive by the GPU work), so can be _very_
++        // expensive.
++        drop_finished_encoders(finished);
++        crate::aqw_stats::ACTIVE_SUBMISSIONS.store(self.active.len(), core::sync::atomic::Ordering::Relaxed);
+         work_done_closures
+     }
+ 
+@@ -433,3 +434,73 @@ impl LifetimeTracker {
+         pending_callbacks
+     }
+ }
++
++/// AQW build of Ruffle: drops finished command buffers on a background thread instead of
++/// inside `Queue::submit` on the caller's (main) thread. Everything they hold is only kept
++/// alive for GPU work that has already completed, and resource destruction is thread-safe.
++/// `WGPU_INLINE_ENCODER_DROP` restores dropping inline.
++#[cfg(feature = "std")]
++fn drop_finished_encoders(encoders: Vec<EncoderInFlight>) {
++    use std::sync::{mpsc, Mutex, OnceLock};
++    if encoders.is_empty() {
++        return;
++    }
++    static SENDER: OnceLock<Option<Mutex<mpsc::Sender<Vec<EncoderInFlight>>>>> = OnceLock::new();
++    let sender = SENDER.get_or_init(|| {
++        if std::env::var_os("WGPU_INLINE_ENCODER_DROP").is_some() {
++            return None;
++        }
++        let (sender, receiver) = mpsc::channel::<Vec<EncoderInFlight>>();
++        std::thread::Builder::new()
++            .name("wgpu encoder drop".into())
++            .spawn(move || {
++                for batch in receiver {
++                    profiling::scope!("drop command buffer trackers");
++                    let count = batch.len();
++                    drop(batch);
++                    crate::aqw_stats::ENCODERS_DROPPED
++                        .fetch_add(count, core::sync::atomic::Ordering::Release);
++                }
++            })
++            .ok()?;
++        Some(Mutex::new(sender))
++    });
++    let count = encoders.len();
++    let encoders = match sender {
++        Some(sender) => match sender.lock().map(|s| {
++            crate::aqw_stats::ENCODERS_QUEUED.fetch_add(count, core::sync::atomic::Ordering::Relaxed);
++            s.send(encoders)
++        }) {
++            Ok(Ok(())) => return,
++            Ok(Err(mpsc::SendError(encoders))) => encoders,
++            Err(_) => return,
++        },
++        None => encoders,
++    };
++    profiling::scope!("drop command buffer trackers");
++    drop(encoders);
++}
++
++/// AQW build: waits until the background thread has dropped every command buffer handed to
++/// it so far (at most 2 s). Needed before reconfiguring a surface.
++#[cfg(feature = "std")]
++pub(crate) fn flush_encoder_drops() {
++    use core::sync::atomic::Ordering;
++    let queued = crate::aqw_stats::ENCODERS_QUEUED.load(Ordering::Acquire);
++    let start = std::time::Instant::now();
++    while crate::aqw_stats::ENCODERS_DROPPED.load(Ordering::Acquire) < queued
++        && start.elapsed() < std::time::Duration::from_secs(2)
++    {
++        std::thread::sleep(std::time::Duration::from_micros(200));
++    }
++}
++
++#[cfg(not(feature = "std"))]
++pub(crate) fn flush_encoder_drops() {}
++
++#[cfg(not(feature = "std"))]
++fn drop_finished_encoders(encoders: Vec<EncoderInFlight>) {
++    profiling::scope!("drop command buffer trackers");
++    drop(encoders);
++}
++
+diff --git a/src/device/mod.rs b/src/device/mod.rs
+index a38020d..9de68d7 100644
+--- a/src/device/mod.rs
++++ b/src/device/mod.rs
+@@ -23,6 +23,8 @@ use wgt::{
+ pub(crate) mod bgl;
+ pub mod global;
+ mod life;
++// AQW build: for `crate::aqw_flush_encoder_drops`.
++pub(crate) use life::flush_encoder_drops;
+ pub mod queue;
+ pub mod ray_tracing;
+ pub mod resource;
+diff --git a/src/device/queue.rs b/src/device/queue.rs
+index 1c0ac26..fc18a07 100644
+--- a/src/device/queue.rs
++++ b/src/device/queue.rs
+@@ -457,8 +457,15 @@ impl PendingWrites {
+             let pending_textures = mem::take(&mut self.dst_textures);
+             let pending_blas_s = mem::take(&mut self.copied_blas_s);
+ 
+-            let cmd_buf = unsafe { self.command_encoder.end_encoding() }
+-                .map_err(|e| device.handle_hal_error(e))?;
++            let cmd_buf = unsafe { self.command_encoder.end_encoding() }.map_err(|e| {
++                // AQW build: say which step failed.
++                log::error!(
++                    "pending writes end_encoding failed ({e}): {} buffers, {} textures written",
++                    pending_buffers.len(),
++                    pending_textures.len()
++                );
++                device.handle_hal_error(e)
++            })?;
+             self.is_recording = false;
+ 
+             let new_encoder = command_allocator
+@@ -1693,6 +1700,11 @@ impl Queue {
+             Ok(None) => {}
+             Err(e) => return Err(e),
+         }
++        // AQW build: combine what was added since encoding finished (e.g. the transition
++        // command buffers inserted at submission) with the rest (see `InnerCommandEncoder::merge`).
++        for execution in executions.iter_mut() {
++            execution.inner.merge()?;
++        }
+         let hal_command_buffers = executions
+             .iter()
+             .flat_map(|e| e.inner.list.iter().map(|b| b.as_ref()))
+@@ -1716,7 +1728,15 @@ impl Queue {
+                     (self.device.fence.as_ref(), submit_index),
+                 )
+             }
+-            .map_err(|e| self.device.handle_hal_error(e))?;
++            .map_err(|e| {
++                // AQW build: say which step failed.
++                log::error!(
++                    "hal queue submit failed ({e}): {} command buffers, {} surface textures",
++                    hal_command_buffers.len(),
++                    submit_surface_textures.len()
++                );
++                self.device.handle_hal_error(e)
++            })?;
+ 
+             // Submissions must have strictly increasing indices, so we must hold the
+             // command index guard until we have submitted, to prevent another submission
+@@ -1975,7 +1995,12 @@ impl Global {
+             .map(|id| command_buffer_guard.get(*id))
+             .collect::<Vec<_>>();
+         drop(command_buffer_guard);
+-        queue.submit(&command_buffers)
++        let result = queue.submit(&command_buffers);
++        // AQW build: keep the exact submit error in the log.
++        if let Err((_, error)) = &result {
++            log::error!("queue submit failed: {error:?}");
++        }
++        result
+     }
+ 
+     pub fn queue_get_timestamp_period(&self, queue_id: QueueId) -> f32 {
+diff --git a/src/device/resource.rs b/src/device/resource.rs
+index 2e09f25..39a7625 100644
+--- a/src/device/resource.rs
++++ b/src/device/resource.rs
+@@ -1100,8 +1100,11 @@ impl Device {
+             usage,
+             memory_flags: hal::MemoryFlags::empty(),
+         };
+-        let buffer = unsafe { self.raw().create_buffer(&hal_desc) }
+-            .map_err(|e| self.handle_hal_error_with_nonfatal_oom(e))?;
++        let buffer = unsafe { self.raw().create_buffer(&hal_desc) }.map_err(|e| {
++            // AQW build: say which allocation failed.
++            log::error!("create_buffer failed ({e}): {hal_desc:?}");
++            self.handle_hal_error_with_nonfatal_oom(e)
++        })?;
+ 
+         let timestamp_normalization_bind_group = Snatchable::new(unsafe {
+             // SAFETY: The size passed here must not overflow the buffer.
+@@ -1665,8 +1668,11 @@ impl Device {
+             view_formats: hal_view_formats,
+         };
+ 
+-        let raw_texture = unsafe { self.raw().create_texture(&hal_desc) }
+-            .map_err(|e| self.handle_hal_error_with_nonfatal_oom(e))?;
++        let raw_texture = unsafe { self.raw().create_texture(&hal_desc) }.map_err(|e| {
++            // AQW build: say which allocation failed.
++            log::error!("create_texture failed ({e}): {hal_desc:?}");
++            self.handle_hal_error_with_nonfatal_oom(e)
++        })?;
+ 
+         let clear_mode = if hal_usage
+             .intersects(wgt::TextureUses::DEPTH_STENCIL_WRITE | wgt::TextureUses::COLOR_TARGET)
+@@ -5364,6 +5370,11 @@ impl Device {
+                     }
+                 }
+ 
++                // AQW build: finished command buffers may still be waiting on the background
++                // drop thread, holding views of the old swapchain images (DX12's ResizeBuffers
++                // fails while any reference to them exists).
++                crate::device::life::flush_encoder_drops();
++
+                 // All textures must be destroyed before the surface can be re-configured.
+                 if let Some(present) = surface.presentation.lock().take() {
+                     if present.acquired_texture.is_some() {
+diff --git a/src/lib.rs b/src/lib.rs
+index 212aeff..bebfd59 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -251,3 +251,44 @@ mod tests {
+         assert_eq!(get_greatest_common_divisor(7, 7), 7);
+     }
+ }
++
++/// AQW build: waits until finished command buffers handed to the background drop thread are
++/// dropped, so the resources only they kept alive are really freed (e.g. before retrying an
++/// allocation that ran out of memory).
++pub fn aqw_flush_encoder_drops() {
++    device::flush_encoder_drops();
++}
++
++/// AQW build: textures created inside `f` get GPU memory blocks of their own for their
++/// `kind` (see `wgpu_hal::aqw_texture_kind`).
++pub fn aqw_texture_kind<R>(kind: u8, f: impl FnOnce() -> R) -> R {
++    #[cfg(any(dx12, vulkan))]
++    {
++        hal::aqw_texture_kind(kind, f)
++    }
++    #[cfg(not(any(dx12, vulkan)))]
++    {
++        let _ = kind;
++        f()
++    }
++}
++
++/// AQW build: (encoders waiting to be dropped, submissions in flight), for Ruffle's perf log.
++pub fn aqw_stats() -> (usize, usize) {
++    use core::sync::atomic::Ordering::Relaxed;
++    use aqw_stats::*;
++    (
++        ENCODERS_QUEUED.load(Relaxed).saturating_sub(ENCODERS_DROPPED.load(Relaxed)),
++        ACTIVE_SUBMISSIONS.load(Relaxed),
++    )
++}
++
++/// AQW build: counters for Ruffle's perf log.
++pub mod aqw_stats {
++    use core::sync::atomic::AtomicUsize;
++    /// Finished command encoders handed to the background drop thread / dropped by it.
++    pub static ENCODERS_QUEUED: AtomicUsize = AtomicUsize::new(0);
++    pub static ENCODERS_DROPPED: AtomicUsize = AtomicUsize::new(0);
++    /// Submissions the GPU hasn't finished (as of the last triage).
++    pub static ACTIVE_SUBMISSIONS: AtomicUsize = AtomicUsize::new(0);
++}
+diff --git a/src/resource.rs b/src/resource.rs
+index b97bbdf..5d1d756 100644
+--- a/src/resource.rs
++++ b/src/resource.rs
+@@ -1261,8 +1261,11 @@ impl StagingBuffer {
+             memory_flags: hal::MemoryFlags::TRANSIENT,
+         };
+ 
+-        let raw = unsafe { device.raw().create_buffer(&stage_desc) }
+-            .map_err(|e| device.handle_hal_error(e))?;
++        let raw = unsafe { device.raw().create_buffer(&stage_desc) }.map_err(|e| {
++            // AQW build: say which allocation failed.
++            log::error!("staging create_buffer failed ({e}): {stage_desc:?}");
++            device.handle_hal_error(e)
++        })?;
+         let mapping = unsafe { device.raw().map_buffer(raw.as_ref(), 0..size.get()) }
+             .map_err(|e| device.handle_hal_error(e))?;
+ 
+diff --git a/src/track/buffer.rs b/src/track/buffer.rs
+index 8fdbe81..877b39d 100644
+--- a/src/track/buffer.rs
++++ b/src/track/buffer.rs
+@@ -91,8 +91,11 @@ impl BufferUsageScope {
+         strict_assert!(index < self.state.len());
+         self.metadata.tracker_assert_in_bounds(index);
+     }
++    /// Resets only the owned entries; see `ResourceMetadata::clear`.
+     pub fn clear(&mut self) {
+-        self.state.clear();
++        for index in self.metadata.owned_indices() {
++            self.state[index] = BufferUses::empty();
++        }
+         self.metadata.clear();
+     }
+ 
+diff --git a/src/track/metadata.rs b/src/track/metadata.rs
+index f946a53..cd88942 100644
+--- a/src/track/metadata.rs
++++ b/src/track/metadata.rs
+@@ -34,8 +34,15 @@ impl<T: Clone> ResourceMetadata<T> {
+         resize_bitvec(&mut self.owned, size);
+     }
+ 
++    /// Removes all members but keeps the tables at their current size.
++    ///
++    /// Usage scopes are pooled and resized to the device's full resource count on reuse,
++    /// so truncating here made every render pass pay O(total resources) twice (drop every
++    /// slot, then refill every slot). Only the owned slots need resetting.
+     pub(super) fn clear(&mut self) {
+-        self.resources.clear();
++        for index in iterate_bitvec_indices(&self.owned) {
++            self.resources[index] = None;
++        }
+         self.owned.fill(false);
+     }
+ 
+diff --git a/src/track/texture.rs b/src/track/texture.rs
+index 6cea592..29363a9 100644
+--- a/src/track/texture.rs
++++ b/src/track/texture.rs
+@@ -183,11 +183,6 @@ impl TextureStateSet {
+         }
+     }
+ 
+-    fn clear(&mut self) {
+-        self.simple.clear();
+-        self.complex.clear();
+-    }
+-
+     fn set_size(&mut self, size: usize) {
+         self.simple.resize(size, TextureUses::UNINITIALIZED);
+     }
+@@ -284,8 +279,12 @@ impl TextureUsageScope {
+         self.set.tracker_assert_in_bounds(index);
+     }
+ 
++    /// Resets only the owned entries; see `ResourceMetadata::clear`.
+     pub fn clear(&mut self) {
+-        self.set.clear();
++        for index in self.metadata.owned_indices() {
++            self.set.simple[index] = TextureUses::UNINITIALIZED;
++        }
++        self.set.complex.clear();
+         self.metadata.clear();
+     }
+ 

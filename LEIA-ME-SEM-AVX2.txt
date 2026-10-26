@@ -1,0 +1,16 @@
+VERSAO SEM AVX2 (para CPUs com AVX mas sem AVX2)
+
+O que mudou: em source/build.ps1 (Windows) e source/build.sh (Linux), o alvo de compilacao
+passou de x86-64-v3 (AVX2) para x86-64-v2 + AVX. Nada mais foi alterado no codigo do Mugetsu.
+
+Como gerar o Mugetsu.exe:
+ A) GitHub (sem instalar nada): crie uma conta, faca um fork/upload desta pasta como repositorio,
+    va em Actions > "Build Mugetsu" > Run workflow. Quando terminar, baixe o artefato "Mugetsu-1.5.1".
+ B) No seu PC: instale Rust 1.99.0 (rustup), Java 17+ e git, e rode em source/:
+    powershell -ExecutionPolicy Bypass -File build.ps1
+    (se der erro com o perfil de velocidade, use -NoPgo). Resultado: source\build\out\Mugetsu.exe
+
+Se mesmo assim aparecer a mensagem "needs a processor with AVX2", sua CPU nao tem nem AVX:
+troque "-Ctarget-feature=+avx" por nada (deixe so x86-64-v2) ou use "-Ctarget-cpu=x86-64".
+
+Aviso: versao nao oficial, sem garantia do autor do Mugetsu.
